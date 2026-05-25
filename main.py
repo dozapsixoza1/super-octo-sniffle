@@ -10,17 +10,19 @@ import json
 import logging
 import os
 import random
+import time
 from collections import defaultdict
 from datetime import datetime
 
 from telegram import (
     Bot,
+    ChatPermissions,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LabeledPrice,
     Update,
 )
-from telegram.constants import ChatType, ParseMode
+from telegram.constants import ChatMemberStatus, ChatType, ParseMode
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -38,10 +40,6 @@ GROUP_USERNAME = "chatlancet"
 GROUP_CHAT_ID  = -1003773742747
 BALANCE_FILE   = "balance.json"
 WINNER_PHOTO   = "https://i.ibb.co/KdB8vWF/IMG-20260526-030956-075.jpg"
-
-# ID администраторов — они не участвуют в ивентах
-# Заполни своими admin user_id, OWNER_ID добавляется автоматически
-ADMIN_IDS: set[int] = {OWNER_ID}
 # =====================================================
 
 logging.basicConfig(
@@ -51,15 +49,22 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ─── Глобальное состояние ────────────────────────────
-active_event:   dict | None = None
-event_task:     asyncio.Task | None = None
-msg_counts      = defaultdict(int)
-usernames:      dict[int, str] = {}
-pending_prize:  str | None = None
-pending_stars:  int | None = None
+active_event:    dict | None = None
+event_task:      asyncio.Task | None = None
+msg_counts       = defaultdict(int)
+usernames:       dict[int, str] = {}
+pending_prize:   str | None = None
+pending_stars:   int | None = None
 waiting_custom_topup: bool = False
-pinned_msg_id:  int | None = None          # id закреплённого сообщения
-last_channel_post_id: int | None = None    # фикс дублей от канала
+pinned_msg_id:   int | None = None
+
+# Кеш статусов админов: {user_id: (is_admin: bool, timestamp)}
+admin_cache:     dict[int, tuple[bool, float]] = {}
+ADMIN_CACHE_TTL  = 60  # секунд
+
+# Фикс дублей от канала: {media_group_id или message_id: timestamp}
+seen_channel_posts: dict[str, float] = {}
+CHANNEL_POST_TTL = 10  # секунд — окно дедупликации
 # ─────────────────────────────────────────────────────
 
 STAR_AMOUNTS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
@@ -143,9 +148,34 @@ def is_allowed_chat(chat_id: int, username: str | None) -> bool:
     return False
 
 
-def is_admin(user_id: int) -> bool:
-    """Возвращает True если пользователь — владелец или админ."""
-    return user_id in ADMIN_IDS
+async def is_chat_admin(bot: Bot, user_id: int) -> bool:
+    """
+    Проверяет реальный статус пользователя в чате через Telegram API.
+    Кеширует результат на ADMIN_CACHE_TTL секунд.
+    Владелец бота всегда считается админом.
+    """
+    if user_id == OWNER_ID:
+        return True
+
+    now = time.monotonic()
+    cached = admin_cache.get(user_id)
+    if cached and (now - cached[1]) < ADMIN_CACHE_TTL:
+        return cached[0]
+
+    try:
+        member = await bot.get_chat_member(
+            chat_id=GROUP_CHAT_ID or f"@{GROUP_USERNAME}",
+            user_id=user_id,
+        )
+        result = member.status in (
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.OWNER,
+        )
+    except Exception:
+        result = False
+
+    admin_cache[user_id] = (result, now)
+    return result
 
 
 def mention(user_id: int) -> str:
@@ -154,13 +184,10 @@ def mention(user_id: int) -> str:
 
 
 async def send_group(bot: Bot, text: str) -> int | None:
-    """Отправляет сообщение в группу, возвращает message_id."""
     target = GROUP_CHAT_ID or f"@{GROUP_USERNAME}"
     try:
         sent = await bot.send_message(
-            chat_id=target,
-            text=text,
-            parse_mode=ParseMode.MARKDOWN,
+            chat_id=target, text=text, parse_mode=ParseMode.MARKDOWN,
         )
         return sent.message_id
     except Exception as e:
@@ -169,7 +196,6 @@ async def send_group(bot: Bot, text: str) -> int | None:
 
 
 async def pin_in_group(bot: Bot, message_id: int):
-    """Закрепляет сообщение в группе."""
     global pinned_msg_id
     target = GROUP_CHAT_ID or f"@{GROUP_USERNAME}"
     try:
@@ -184,7 +210,6 @@ async def pin_in_group(bot: Bot, message_id: int):
 
 
 async def unpin_in_group(bot: Bot):
-    """Открепляет закреплённое ботом сообщение."""
     global pinned_msg_id
     if not pinned_msg_id:
         return
@@ -231,27 +256,99 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/announce `<текст>` — анонс в группу\n"
         "/stats — статистика ивента\n"
         "/history — история транзакций\n"
-        "/addadmin `<user_id>` — добавить админа\n\n"
+        "/admin `@username Звание` — выдать админку в чате\n\n"
         "Или просто пришли текст приза — спрошу тип ивента 🎯",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 
 # ══════════════════════════════════════════════════════
-#  /addadmin
+#  /admin — выдача прав администратора + звание
 # ══════════════════════════════════════════════════════
 
-async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Использование: /admin @username Звание
+    Бот выдаёт пользователю права администратора в чате
+    и устанавливает ему звание (custom title).
+    """
     msg = update.message
     if msg.chat.type != ChatType.PRIVATE or msg.from_user.id != OWNER_ID:
         return
-    args = msg.text.split()
-    if len(args) < 2 or not args[1].isdigit():
-        await msg.reply_text("Использование: `/addadmin 123456789`", parse_mode=ParseMode.MARKDOWN)
+
+    parts = msg.text.split(maxsplit=2)
+    # parts[0] = /admin, parts[1] = @username, parts[2] = звание
+    if len(parts) < 3:
+        await msg.reply_text(
+            "Использование: `/admin @username Звание`\n\n"
+            "Пример: `/admin @vasya Модератор`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         return
-    uid = int(args[1])
-    ADMIN_IDS.add(uid)
-    await msg.reply_text(f"✅ Пользователь `{uid}` добавлен в список админов.", parse_mode=ParseMode.MARKDOWN)
+
+    username_raw = parts[1].lstrip("@")
+    title = parts[2][:16]  # Telegram ограничивает звание 16 символами
+
+    target_chat = GROUP_CHAT_ID or f"@{GROUP_USERNAME}"
+
+    # Пробуем найти пользователя — сначала по username из нашего кеша
+    target_id = None
+    for uid, uname in usernames.items():
+        if uname.lower() == username_raw.lower():
+            target_id = uid
+            break
+
+    if not target_id:
+        # Пробуем через getChatMember по username (работает если юзер есть в чате)
+        try:
+            member = await context.bot.get_chat_member(
+                chat_id=target_chat,
+                user_id=f"@{username_raw}",
+            )
+            target_id = member.user.id
+        except Exception:
+            await msg.reply_text(
+                f"❌ Не могу найти @{username_raw} в чате.\n\n"
+                "Убедись что пользователь писал в чате хотя бы раз, "
+                "или попроси его написать сообщение.",
+            )
+            return
+
+    try:
+        # Выдаём права администратора
+        await context.bot.promote_chat_member(
+            chat_id=target_chat,
+            user_id=target_id,
+            can_delete_messages=True,
+            can_restrict_members=True,
+            can_pin_messages=True,
+            can_invite_users=True,
+            can_manage_chat=True,
+            can_manage_video_chats=False,
+            is_anonymous=False,
+        )
+        # Устанавливаем звание
+        await context.bot.set_chat_administrator_custom_title(
+            chat_id=target_chat,
+            user_id=target_id,
+            custom_title=title,
+        )
+        # Инвалидируем кеш для этого пользователя
+        admin_cache.pop(target_id, None)
+
+        await msg.reply_text(
+            f"✅ @{username_raw} теперь администратор!\n"
+            f"🏷 Звание: *{title}*",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        log.info(f"Выдана админка @{username_raw} ({target_id}), звание: {title}")
+
+    except Exception as e:
+        await msg.reply_text(
+            f"❌ Ошибка при выдаче прав: `{e}`\n\n"
+            "Убедись что бот сам является администратором с правом добавлять админов.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
 
 # ══════════════════════════════════════════════════════
@@ -517,11 +614,10 @@ async def on_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════
-#  Выдача звёзд победителю
+#  Победитель
 # ══════════════════════════════════════════════════════
 
 async def send_winner_message(bot: Bot, user_id: int, prize_name: str, stars: int = 0):
-    """Отправляет победителю фото + поздравление."""
     stars_line = f"⭐ Тебе начислено: *{stars} звёзд*\n\n" if stars else ""
     caption = (
         f"🎉 *Поздравляю!*\n"
@@ -533,10 +629,8 @@ async def send_winner_message(bot: Bot, user_id: int, prize_name: str, stars: in
     )
     try:
         await bot.send_photo(
-            chat_id=user_id,
-            photo=WINNER_PHOTO,
-            caption=caption,
-            parse_mode=ParseMode.MARKDOWN,
+            chat_id=user_id, photo=WINNER_PHOTO,
+            caption=caption, parse_mode=ParseMode.MARKDOWN,
         )
     except Exception:
         try:
@@ -636,7 +730,6 @@ async def start_event(bot: Bot, etype: str, prize: str, stars: int = 0):
     else:
         text = texts.get(etype, f"🐸 *Ивент начался!*\n\n🎁 Приз: *{prize}*{stars_txt}")
 
-    # Отправляем и закрепляем
     mid = await send_group(bot, text)
     if mid:
         await pin_in_group(bot, mid)
@@ -700,7 +793,6 @@ async def declare_winner(bot: Bot, user_id: int, prize: str, stars: int = 0):
         f"🎁 Приз: *{prize}*{stars_txt}"
     )
     mid = await send_group(bot, end_text)
-    # Закрепляем итог
     if mid:
         await pin_in_group(bot, mid)
 
@@ -738,7 +830,7 @@ async def stop_event(bot: Bot):
 # ══════════════════════════════════════════════════════
 
 async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global active_event, last_channel_post_id
+    global active_event, seen_channel_posts
 
     msg = update.message
     if not msg:
@@ -747,15 +839,22 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed_chat(msg.chat.id, msg.chat.username):
         return
 
-    # ── Пост из канала → одно приветствие на пост (фикс дублей) ──
+    # ── Пост из канала → одно приветствие на пост/альбом ──
     if msg.sender_chat and msg.sender_chat.type == "channel":
-        # media_group_id объединяет альбомы — один ответ на весь альбом
-        media_group = msg.media_group_id
-        post_key = media_group if media_group else str(msg.message_id)
+        now = time.monotonic()
 
-        if post_key == last_channel_post_id:
-            return  # уже ответили на этот пост/альбом
-        last_channel_post_id = post_key
+        # Чистим старые записи
+        seen_channel_posts = {
+            k: v for k, v in seen_channel_posts.items()
+            if now - v < CHANNEL_POST_TTL
+        }
+
+        # Ключ: media_group объединяет альбом, иначе сам message_id
+        post_key = str(msg.media_group_id) if msg.media_group_id else str(msg.message_id)
+
+        if post_key in seen_channel_posts:
+            return  # уже ответили
+        seen_channel_posts[post_key] = now
 
         try:
             await msg.reply_text(
@@ -769,21 +868,20 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.warning(f"Ошибка ответа на пост: {e}")
         return
 
-    # ── Обычное сообщение от пользователя ──
+    # ── Обычное сообщение ──
     user = msg.from_user
     if not user:
         return
 
-    # Сохраняем username
     if user.username:
         usernames[user.id] = user.username
 
-    # Игнорируем входы/выходы и системные сообщения
+    # Игнорируем системные события (вход/выход)
     if msg.new_chat_members or msg.left_chat_member:
         return
 
-    # Админы и владелец не участвуют в ивентах
-    if is_admin(user.id):
+    # Проверяем реальный статус в чате через Telegram API
+    if await is_chat_admin(context.bot, user.id):
         return
 
     if not active_event:
@@ -797,8 +895,6 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if old != user.id:
             active_event["leader"] = user.id
             active_event["leader_since"] = datetime.now()
-            # Уведомление о перебиве только если был предыдущий лидер
-            # и это не первое сообщение (old не None)
             if old is not None:
                 await send_group(
                     context.bot,
@@ -878,7 +974,7 @@ def main():
     app.add_handler(CommandHandler("stop",     cmd_stop))
     app.add_handler(CommandHandler("announce", cmd_announce))
     app.add_handler(CommandHandler("stats",    cmd_stats))
-    app.add_handler(CommandHandler("addadmin", cmd_addadmin))
+    app.add_handler(CommandHandler("admin",    cmd_admin))
 
     app.add_handler(CallbackQueryHandler(on_callback))
 
