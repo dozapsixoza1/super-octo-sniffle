@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Бот для раздачи подарков и ивентов
+Бот для раздачи подарков и ивентов — @godlancet
 Фреймворк: python-telegram-bot 20.x (PTB)
 """
 
@@ -32,11 +32,16 @@ from telegram.ext import (
 )
 
 # ===================== НАСТРОЙКИ =====================
-BOT_TOKEN      = "8960488730:AAGG_hEVvnQeijdvN3VunNptLy6wFhDBkjg"
-OWNER_ID       = 8737315231
-GROUP_USERNAME = "PoseidonsGift"
-GROUP_CHAT_ID  = -1003846138616
+BOT_TOKEN      = "8888151886:AAG5HT_2w21knElyzBI0WakUfNOZTRho_OQ"
+OWNER_ID       = 8675927241
+GROUP_USERNAME = "chatlancet"
+GROUP_CHAT_ID  = -1003773742747
 BALANCE_FILE   = "balance.json"
+WINNER_PHOTO   = "https://i.ibb.co/KdB8vWF/IMG-20260526-030956-075.jpg"
+
+# ID администраторов — они не участвуют в ивентах
+# Заполни своими admin user_id, OWNER_ID добавляется автоматически
+ADMIN_IDS: set[int] = {OWNER_ID}
 # =====================================================
 
 logging.basicConfig(
@@ -46,13 +51,15 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ─── Глобальное состояние ────────────────────────────
-active_event:  dict | None = None
-event_task:    asyncio.Task | None = None
-msg_counts     = defaultdict(int)
-usernames:     dict[int, str] = {}
-pending_prize: str | None = None
-pending_stars: int | None = None
+active_event:   dict | None = None
+event_task:     asyncio.Task | None = None
+msg_counts      = defaultdict(int)
+usernames:      dict[int, str] = {}
+pending_prize:  str | None = None
+pending_stars:  int | None = None
 waiting_custom_topup: bool = False
+pinned_msg_id:  int | None = None          # id закреплённого сообщения
+last_channel_post_id: int | None = None    # фикс дублей от канала
 # ─────────────────────────────────────────────────────
 
 STAR_AMOUNTS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
@@ -108,10 +115,8 @@ def add_balance(amount: int, note: str = ""):
     data = load_balance()
     data["balance"] += amount
     data["transactions"].append({
-        "type": "topup",
-        "amount": amount,
-        "note": note,
-        "time": datetime.now().isoformat(),
+        "type": "topup", "amount": amount,
+        "note": note, "time": datetime.now().isoformat(),
     })
     save_balance(data)
 
@@ -120,10 +125,8 @@ def deduct_balance(amount: int, winner: str = ""):
     data = load_balance()
     data["balance"] -= amount
     data["transactions"].append({
-        "type": "payout",
-        "amount": amount,
-        "winner": winner,
-        "time": datetime.now().isoformat(),
+        "type": "payout", "amount": amount,
+        "winner": winner, "time": datetime.now().isoformat(),
     })
     save_balance(data)
 
@@ -140,18 +143,57 @@ def is_allowed_chat(chat_id: int, username: str | None) -> bool:
     return False
 
 
+def is_admin(user_id: int) -> bool:
+    """Возвращает True если пользователь — владелец или админ."""
+    return user_id in ADMIN_IDS
+
+
 def mention(user_id: int) -> str:
     uname = usernames.get(user_id)
     return f"@{uname}" if uname else f"[пользователь](tg://user?id={user_id})"
 
 
-async def send_group(bot: Bot, text: str):
+async def send_group(bot: Bot, text: str) -> int | None:
+    """Отправляет сообщение в группу, возвращает message_id."""
     target = GROUP_CHAT_ID or f"@{GROUP_USERNAME}"
-    await bot.send_message(
-        chat_id=target,
-        text=text,
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    try:
+        sent = await bot.send_message(
+            chat_id=target,
+            text=text,
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return sent.message_id
+    except Exception as e:
+        log.warning(f"send_group error: {e}")
+        return None
+
+
+async def pin_in_group(bot: Bot, message_id: int):
+    """Закрепляет сообщение в группе."""
+    global pinned_msg_id
+    target = GROUP_CHAT_ID or f"@{GROUP_USERNAME}"
+    try:
+        await bot.pin_chat_message(
+            chat_id=target,
+            message_id=message_id,
+            disable_notification=False,
+        )
+        pinned_msg_id = message_id
+    except Exception as e:
+        log.warning(f"pin error: {e}")
+
+
+async def unpin_in_group(bot: Bot):
+    """Открепляет закреплённое ботом сообщение."""
+    global pinned_msg_id
+    if not pinned_msg_id:
+        return
+    target = GROUP_CHAT_ID or f"@{GROUP_USERNAME}"
+    try:
+        await bot.unpin_chat_message(chat_id=target, message_id=pinned_msg_id)
+    except Exception as e:
+        log.warning(f"unpin error: {e}")
+    pinned_msg_id = None
 
 
 def make_kb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
@@ -169,16 +211,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if msg.chat.type != ChatType.PRIVATE:
         return
-
     if msg.from_user.id != OWNER_ID:
         await msg.reply_text(
             "👋 Привет!\n"
-            "Общайся в нашем чате и получай возможность выиграть *Мишку* от @grith! 🐻\n\n"
-            "Переходи: @PoseidonsGift",
+            "Общайся в нашем чате и получай возможность выиграть *Мишку* от @godlancet! 🐻\n\n"
+            "Переходи: @chatlancet",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
-
     bal = get_balance()
     await msg.reply_text(
         "👑 *Панель владельца*\n\n"
@@ -190,10 +230,28 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/stop — остановить ивент\n"
         "/announce `<текст>` — анонс в группу\n"
         "/stats — статистика ивента\n"
-        "/history — история транзакций\n\n"
+        "/history — история транзакций\n"
+        "/addadmin `<user_id>` — добавить админа\n\n"
         "Или просто пришли текст приза — спрошу тип ивента 🎯",
         parse_mode=ParseMode.MARKDOWN,
     )
+
+
+# ══════════════════════════════════════════════════════
+#  /addadmin
+# ══════════════════════════════════════════════════════
+
+async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if msg.chat.type != ChatType.PRIVATE or msg.from_user.id != OWNER_ID:
+        return
+    args = msg.text.split()
+    if len(args) < 2 or not args[1].isdigit():
+        await msg.reply_text("Использование: `/addadmin 123456789`", parse_mode=ParseMode.MARKDOWN)
+        return
+    uid = int(args[1])
+    ADMIN_IDS.add(uid)
+    await msg.reply_text(f"✅ Пользователь `{uid}` добавлен в список админов.", parse_mode=ParseMode.MARKDOWN)
 
 
 # ══════════════════════════════════════════════════════
@@ -244,7 +302,6 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_topup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.chat.type != ChatType.PRIVATE or update.message.from_user.id != OWNER_ID:
         return
-
     rows = []
     row = []
     for i, amount in enumerate(STAR_AMOUNTS):
@@ -255,12 +312,9 @@ async def cmd_topup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if row:
         rows.append(row)
     rows.append([("✏️ Своя сумма", "topup:custom")])
-
     bal = get_balance()
     await update.message.reply_text(
-        f"💰 *Пополнение баланса*\n\n"
-        f"Текущий баланс: *{bal} ⭐*\n\n"
-        "Выбери сколько звёзд пополнить:",
+        f"💰 *Пополнение баланса*\n\nТекущий баланс: *{bal} ⭐*\n\nВыбери сколько звёзд пополнить:",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=make_kb(rows),
     )
@@ -275,12 +329,10 @@ async def cmd_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if msg.chat.type != ChatType.PRIVATE or msg.from_user.id != OWNER_ID:
         return
-
     args = msg.text.split(maxsplit=1)
     if len(args) < 2:
         await msg.reply_text("Укажи приз: `/event Eternal Rose #6198`", parse_mode=ParseMode.MARKDOWN)
         return
-
     pending_prize = args[1]
     await ask_prize_stars(msg)
 
@@ -298,11 +350,9 @@ async def ask_prize_stars(msg):
     if row:
         rows.append(row)
     rows.append([("🎁 Без звёздного приза", "pstars:0")])
-
     await msg.reply_text(
         f"⭐ *Сколько звёзд получит победитель?*\n\n"
-        f"💰 Баланс бота: *{bal} ⭐*\n"
-        f"✅ — хватает   ❌ — недостаточно",
+        f"💰 Баланс бота: *{bal} ⭐*\n✅ — хватает   ❌ — недостаточно",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=make_kb(rows),
     )
@@ -382,14 +432,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = cb.data
     await cb.answer()
 
-    # ── Пополнение ────────────────────────────────────
     if data.startswith("topup:"):
         amount_str = data[6:]
         if amount_str == "custom":
             waiting_custom_topup = True
             await cb.message.edit_text("✏️ Введи сумму пополнения (число звёзд):")
             return
-
         amount = int(amount_str)
         await cb.message.edit_text(f"💳 Создаю счёт на *{amount} ⭐*...", parse_mode=ParseMode.MARKDOWN)
         try:
@@ -405,7 +453,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await cb.message.reply_text(f"❌ Ошибка создания счёта: {e}")
         return
 
-    # ── Выбор звёзд для приза ─────────────────────────
     if data.startswith("pstars:"):
         pending_stars = int(data[7:])
         await cb.message.edit_text(
@@ -415,39 +462,26 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN,
         )
         kb = make_kb([[(label, f"etype:{code}")] for code, label in EVENT_TYPES])
-        await cb.message.reply_text(
-            "🎮 Выбери тип ивента:",
-            reply_markup=kb,
-        )
+        await cb.message.reply_text("🎮 Выбери тип ивента:", reply_markup=kb)
         return
 
-    # ── Тип ивента ────────────────────────────────────
     if data.startswith("etype:"):
-        etype  = data[6:]
-        prize  = pending_prize or "???"
-        stars  = pending_stars or 0
+        etype = data[6:]
+        prize = pending_prize or "???"
+        stars = pending_stars or 0
         pending_prize = None
         pending_stars = None
         bal = get_balance()
-
         if stars > 0 and bal < stars:
             await cb.message.edit_text(
-                f"❌ *Недостаточно звёзд!*\n\n"
-                f"Нужно: {stars}⭐\n"
-                f"На балансе: {bal}⭐\n\n"
-                f"Пополни баланс: /topup",
+                f"❌ *Недостаточно звёзд!*\n\nНужно: {stars}⭐\nНа балансе: {bal}⭐\n\nПополни баланс: /topup",
                 parse_mode=ParseMode.MARKDOWN,
             )
             return
-
-        await cb.message.edit_text(
-            f"🚀 Запускаю ивент «{prize}» ({stars}⭐)...",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await cb.message.edit_text(f"🚀 Запускаю ивент «{prize}» ({stars}⭐)...", parse_mode=ParseMode.MARKDOWN)
         await start_event(context.bot, etype, prize, stars)
         return
 
-    # ── Стоп ──────────────────────────────────────────
     if data == "stop_yes":
         await stop_event(context.bot)
         await cb.message.edit_text("✅ Ивент остановлен.")
@@ -473,14 +507,10 @@ async def on_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     payment = msg.successful_payment
     amount  = payment.total_amount
     payload = payment.invoice_payload
-
     add_balance(amount, note=f"invoice: {payload}")
     bal = get_balance()
-
     await msg.reply_text(
-        f"✅ *Баланс пополнен!*\n\n"
-        f"➕ Зачислено: *{amount} ⭐*\n"
-        f"💰 Новый баланс: *{bal} ⭐*",
+        f"✅ *Баланс пополнен!*\n\n➕ Зачислено: *{amount} ⭐*\n💰 Новый баланс: *{bal} ⭐*",
         parse_mode=ParseMode.MARKDOWN,
     )
     log.info(f"Баланс пополнен на {amount} звёзд. Итого: {bal}")
@@ -490,24 +520,35 @@ async def on_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  Выдача звёзд победителю
 # ══════════════════════════════════════════════════════
 
-async def payout_winner(bot: Bot, user_id: int, stars: int, prize_name: str):
-    uname = usernames.get(user_id, str(user_id))
-    deduct_balance(stars, winner=f"@{uname}")
-
+async def send_winner_message(bot: Bot, user_id: int, prize_name: str, stars: int = 0):
+    """Отправляет победителю фото + поздравление."""
+    stars_line = f"⭐ Тебе начислено: *{stars} звёзд*\n\n" if stars else ""
+    caption = (
+        f"🎉 *Поздравляю!*\n"
+        f"🎁 Ты выиграл *{prize_name}* 🧸 от @godlancet\n"
+        f"✅ Подарок отправлен.\n\n"
+        f"{stars_line}"
+        f"‼️ Пишите сообщения в чате, и получайте возможность так же залутать подарки\n\n"
+        f"👾 Так же вы можете выбить мишку у @grith в его чате — @PoseidonsGift"
+    )
     try:
-        await bot.send_message(
+        await bot.send_photo(
             chat_id=user_id,
-            text=(
-                f"🎉 *Поздравляю! Ты победил в ивенте!*\n\n"
-                f"🏆 Приз: *{prize_name}*\n"
-                f"⭐ Тебе начислено: *{stars} звёзд*\n\n"
-                f"Звёзды будут отправлены в течение нескольких минут от @grith"
-            ),
+            photo=WINNER_PHOTO,
+            caption=caption,
             parse_mode=ParseMode.MARKDOWN,
         )
     except Exception:
-        pass
+        try:
+            await bot.send_message(chat_id=user_id, text=caption, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass
 
+
+async def payout_winner(bot: Bot, user_id: int, stars: int, prize_name: str):
+    uname = usernames.get(user_id, str(user_id))
+    deduct_balance(stars, winner=f"@{uname}")
+    await send_winner_message(bot, user_id, prize_name, stars)
     bal = get_balance()
     await bot.send_message(
         chat_id=OWNER_ID,
@@ -547,32 +588,31 @@ async def start_event(bot: Bot, etype: str, prize: str, stars: int = 0):
     stars_txt = f" + *{stars} ⭐*" if stars else ""
 
     texts = {
-        "last_leader": (
+        "last_leader":  (
             f"🐸 *Ивент начался!*\n\n"
             f"⏰ Цель: продержаться *3 мин без перебива.*\n\n"
             f"🎁 Приз: *{prize}*{stars_txt}"
         ),
-        "most_active": (
+        "most_active":  (
             f"💬 *Ивент «Самый активный» начался!*\n\n"
             f"⏱ *5 минут* — кто напишет больше всех, тот побеждает!\n\n"
             f"🎁 Приз: *{prize}*{stars_txt}"
         ),
-        "random_win": (
+        "random_win":   (
             f"🎲 *Ивент «Случайный победитель» начался!*\n\n"
             f"Напиши хоть одно сообщение за 3 минуты — попадёшь в розыгрыш!\n\n"
             f"🎁 Приз: *{prize}*{stars_txt}"
         ),
-        "first_sticker": (
+        "first_sticker":(
             f"🎯 *Ивент «Первый стикер» начался!*\n\n"
             f"Первый кто отправит *любой стикер* — побеждает!\n\n"
             f"🎁 Приз: *{prize}*{stars_txt}"
         ),
-        "x2_stars": (
-            f"⭐⭐ *Ивент X2 начался!*\n\n"
-            f"В течение *15 минут* — активный чат!\n\n"
+        "x2_stars":     (
+            f"⭐⭐ *Ивент X2 начался!*\n\nВ течение *15 минут* — активный чат!\n\n"
             f"🎁 Бонусный приз: *{prize}*{stars_txt}"
         ),
-        "lottery": (
+        "lottery":      (
             f"🎟 *Лотерея началась!*\n\n"
             f"Напиши любое сообщение за *5 минут* — получишь лотерейный билет!\n\n"
             f"🎁 Приз: *{prize}*{stars_txt}"
@@ -596,7 +636,10 @@ async def start_event(bot: Bot, etype: str, prize: str, stars: int = 0):
     else:
         text = texts.get(etype, f"🐸 *Ивент начался!*\n\n🎁 Приз: *{prize}*{stars_txt}")
 
-    await send_group(bot, text)
+    # Отправляем и закрепляем
+    mid = await send_group(bot, text)
+    if mid:
+        await pin_in_group(bot, mid)
 
     tasks_map = {
         "last_leader":  lambda: run_last_leader(bot, prize, stars),
@@ -632,15 +675,12 @@ async def run_timed(bot: Bot, prize: str, stars: int, duration: int, mode: str):
     await asyncio.sleep(duration)
     if not active_event:
         return
-
     if mode == "x2":
         await send_group(bot, "⭐ *Ивент X2 завершён!* Спасибо за активность!")
-
     if not msg_counts:
         await send_group(bot, "😔 Никто не участвовал. Ивент отменён.")
         active_event = None
         return
-
     winner_id = (
         max(msg_counts, key=msg_counts.get)
         if mode == "active"
@@ -654,12 +694,15 @@ async def declare_winner(bot: Bot, user_id: int, prize: str, stars: int = 0):
     w = mention(user_id)
     stars_txt = f"\n⭐ Звёзды: *{stars}*" if stars else ""
 
-    await send_group(
-        bot,
+    end_text = (
         f"🎉 *Ивент завершён!*\n\n"
         f"🏆 Победитель: {w}\n"
-        f"🎁 Приз: *{prize}*{stars_txt}",
+        f"🎁 Приз: *{prize}*{stars_txt}"
     )
+    mid = await send_group(bot, end_text)
+    # Закрепляем итог
+    if mid:
+        await pin_in_group(bot, mid)
 
     active_event = None
     msg_counts.clear()
@@ -667,6 +710,7 @@ async def declare_winner(bot: Bot, user_id: int, prize: str, stars: int = 0):
     if stars > 0:
         await payout_winner(bot, user_id, stars, prize)
     else:
+        await send_winner_message(bot, user_id, prize)
         try:
             await bot.send_message(
                 chat_id=OWNER_ID,
@@ -684,6 +728,7 @@ async def stop_event(bot: Bot):
     event_task = None
     if active_event:
         await send_group(bot, "⛔ *Ивент остановлен администратором.*")
+    await unpin_in_group(bot)
     active_event = None
     msg_counts.clear()
 
@@ -693,7 +738,7 @@ async def stop_event(bot: Bot):
 # ══════════════════════════════════════════════════════
 
 async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global active_event
+    global active_event, last_channel_post_id
 
     msg = update.message
     if not msg:
@@ -702,25 +747,44 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed_chat(msg.chat.id, msg.chat.username):
         return
 
-    # Пост из канала → приветствие
+    # ── Пост из канала → одно приветствие на пост (фикс дублей) ──
     if msg.sender_chat and msg.sender_chat.type == "channel":
+        # media_group_id объединяет альбомы — один ответ на весь альбом
+        media_group = msg.media_group_id
+        post_key = media_group if media_group else str(msg.message_id)
+
+        if post_key == last_channel_post_id:
+            return  # уже ответили на этот пост/альбом
+        last_channel_post_id = post_key
+
         try:
             await msg.reply_text(
                 "Здарова! ⭐\n\n"
-                "Тут ты можешь общаться в комментариях и чате и получить *Мишку* от @grith 🐻\n\n"
+                "Тут ты можешь общаться в комментариях и чате и получить *Мишку* от @godlancet 🐻\n\n"
                 "Просто общайся и получай возможность залутать Мишку или НФТ ПОДАРОК 🎁\n\n"
-                "Также можешь выбить мишку у @godlancet в его чате — @chatlancet",
+                "Также можешь выбить мишку у @grith в его чате — @PoseidonsGift",
                 parse_mode=ParseMode.MARKDOWN,
             )
         except Exception as e:
             log.warning(f"Ошибка ответа на пост: {e}")
         return
 
+    # ── Обычное сообщение от пользователя ──
     user = msg.from_user
     if not user:
         return
+
+    # Сохраняем username
     if user.username:
         usernames[user.id] = user.username
+
+    # Игнорируем входы/выходы и системные сообщения
+    if msg.new_chat_members or msg.left_chat_member:
+        return
+
+    # Админы и владелец не участвуют в ивентах
+    if is_admin(user.id):
+        return
 
     if not active_event:
         return
@@ -733,13 +797,17 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if old != user.id:
             active_event["leader"] = user.id
             active_event["leader_since"] = datetime.now()
-            if old:
+            # Уведомление о перебиве только если был предыдущий лидер
+            # и это не первое сообщение (old не None)
+            if old is not None:
                 await send_group(
                     context.bot,
                     f"🔄 *Перебито!*\n\nНовый лидер: {mention(user.id)}. До конца: 3 мин.",
                 )
+
     elif etype == "first_sticker" and msg.sticker:
         await declare_winner(context.bot, user.id, active_event["prize"], active_event.get("stars", 0))
+
     elif etype == "quiz":
         ans = active_event.get("quiz_answer", "")
         if (msg.text or "").lower().strip() == ans:
@@ -747,7 +815,7 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════
-#  ЛС владельца (кастомная сумма пополнения / новый ивент)
+#  ЛС владельца
 # ══════════════════════════════════════════════════════
 
 async def owner_pm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -783,14 +851,14 @@ async def owner_pm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════
-#  ЛС остальных пользователей
+#  ЛС остальных
 # ══════════════════════════════════════════════════════
 
 async def other_pm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привет!\n"
-        "Общайся в нашем чате и получай возможность выиграть *Мишку* от @grith! 🐻\n\n"
-        "Переходи: @PoseidonsGift",
+        "Общайся в нашем чате и получай возможность выиграть *Мишку* от @godlancet! 🐻\n\n"
+        "Переходи: @chatlancet",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -810,28 +878,25 @@ def main():
     app.add_handler(CommandHandler("stop",     cmd_stop))
     app.add_handler(CommandHandler("announce", cmd_announce))
     app.add_handler(CommandHandler("stats",    cmd_stats))
+    app.add_handler(CommandHandler("addadmin", cmd_addadmin))
 
     app.add_handler(CallbackQueryHandler(on_callback))
 
     app.add_handler(PreCheckoutQueryHandler(pre_checkout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, on_payment))
 
-    app.add_handler(MessageHandler(
-        filters.ChatType.GROUPS,
-        on_group_message,
-    ))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS, on_group_message))
 
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & filters.User(OWNER_ID) & ~filters.COMMAND,
         owner_pm,
     ))
-
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & ~filters.User(OWNER_ID) & ~filters.COMMAND,
         other_pm,
     ))
 
-    log.info("Бот запущен — @PoseidonsGift")
+    log.info("Бот запущен — @chatlancet")
     app.run_polling(drop_pending_updates=True)
 
 
