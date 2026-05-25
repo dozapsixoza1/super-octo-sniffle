@@ -64,7 +64,8 @@ ADMIN_CACHE_TTL  = 60  # секунд
 
 # Фикс дублей от канала: {media_group_id или message_id: timestamp}
 seen_channel_posts: dict[str, float] = {}
-CHANNEL_POST_TTL = 10  # секунд — окно дедупликации
+CHANNEL_POST_TTL  = 10   # секунд — окно дедупликации
+channel_post_lock  = asyncio.Lock()  # мьютекс для параллельных апдейтов альбома
 # ─────────────────────────────────────────────────────
 
 STAR_AMOUNTS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
@@ -268,54 +269,62 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Использование: /admin @username Звание
-    Бот выдаёт пользователю права администратора в чате
-    и устанавливает ему звание (custom title).
+    Использование:
+      /admin 123456789 Модератор   — по user_id (надёжно всегда)
+      /admin @username Модератор   — по username (только если юзер писал в чат)
     """
     msg = update.message
     if msg.chat.type != ChatType.PRIVATE or msg.from_user.id != OWNER_ID:
         return
 
     parts = msg.text.split(maxsplit=2)
-    # parts[0] = /admin, parts[1] = @username, parts[2] = звание
     if len(parts) < 3:
         await msg.reply_text(
-            "Использование: `/admin @username Звание`\n\n"
-            "Пример: `/admin @vasya Модератор`",
+            "Использование:\n"
+            "`/admin 123456789 Модератор` — по ID (надёжнее)\n"
+            "`/admin @username Модератор` — по юзернейму\n\n"
+            "Звание — до 16 символов.\n"
+            "Чтобы узнать ID — перешли боту сообщение нужного человека.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    username_raw = parts[1].lstrip("@")
-    title = parts[2][:16]  # Telegram ограничивает звание 16 символами
-
+    user_arg = parts[1]
+    title = parts[2][:16]
     target_chat = GROUP_CHAT_ID or f"@{GROUP_USERNAME}"
-
-    # Пробуем найти пользователя — сначала по username из нашего кеша
     target_id = None
-    for uid, uname in usernames.items():
-        if uname.lower() == username_raw.lower():
-            target_id = uid
-            break
+    display_name = user_arg
 
-    if not target_id:
-        # Пробуем через getChatMember по username (работает если юзер есть в чате)
-        try:
-            member = await context.bot.get_chat_member(
-                chat_id=target_chat,
-                user_id=f"@{username_raw}",
-            )
-            target_id = member.user.id
-        except Exception:
-            await msg.reply_text(
-                f"❌ Не могу найти @{username_raw} в чате.\n\n"
-                "Убедись что пользователь писал в чате хотя бы раз, "
-                "или попроси его написать сообщение.",
-            )
-            return
+    # Если передан числовой ID — используем напрямую
+    if user_arg.lstrip("@").isdigit():
+        target_id = int(user_arg.lstrip("@"))
+    else:
+        # По username — сначала ищем в кеше
+        username_raw = user_arg.lstrip("@")
+        display_name = f"@{username_raw}"
+        for uid, uname in usernames.items():
+            if uname.lower() == username_raw.lower():
+                target_id = uid
+                break
+        # Если не нашли в кеше — пробуем через API
+        if not target_id:
+            try:
+                member = await context.bot.get_chat_member(
+                    chat_id=target_chat,
+                    user_id=f"@{username_raw}",
+                )
+                target_id = member.user.id
+            except Exception:
+                await msg.reply_text(
+                    f"❌ Не могу найти {display_name}.\n\n"
+                    "Попробуй передать числовой ID вместо username:\n"
+                    "`/admin 123456789 Звание`\n\n"
+                    "Чтобы узнать ID — перешли боту любое сообщение этого человека.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
 
     try:
-        # Выдаём права администратора
         await context.bot.promote_chat_member(
             chat_id=target_chat,
             user_id=target_id,
@@ -327,26 +336,22 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             can_manage_video_chats=False,
             is_anonymous=False,
         )
-        # Устанавливаем звание
         await context.bot.set_chat_administrator_custom_title(
             chat_id=target_chat,
             user_id=target_id,
             custom_title=title,
         )
-        # Инвалидируем кеш для этого пользователя
         admin_cache.pop(target_id, None)
-
         await msg.reply_text(
-            f"✅ @{username_raw} теперь администратор!\n"
+            f"✅ {display_name} теперь администратор!\n"
             f"🏷 Звание: *{title}*",
             parse_mode=ParseMode.MARKDOWN,
         )
-        log.info(f"Выдана админка @{username_raw} ({target_id}), звание: {title}")
-
+        log.info(f"Выдана админка {display_name} ({target_id}), звание: {title}")
     except Exception as e:
         await msg.reply_text(
-            f"❌ Ошибка при выдаче прав: `{e}`\n\n"
-            "Убедись что бот сам является администратором с правом добавлять админов.",
+            f"❌ Ошибка: `{e}`\n\n"
+            "Убедись что у бота есть право добавлять администраторов в чате.",
             parse_mode=ParseMode.MARKDOWN,
         )
 
@@ -841,20 +846,21 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Пост из канала → одно приветствие на пост/альбом ──
     if msg.sender_chat and msg.sender_chat.type == "channel":
-        now = time.monotonic()
-
-        # Чистим старые записи
-        seen_channel_posts = {
-            k: v for k, v in seen_channel_posts.items()
-            if now - v < CHANNEL_POST_TTL
-        }
-
         # Ключ: media_group объединяет альбом, иначе сам message_id
         post_key = str(msg.media_group_id) if msg.media_group_id else str(msg.message_id)
+        now = time.monotonic()
 
-        if post_key in seen_channel_posts:
-            return  # уже ответили
-        seen_channel_posts[post_key] = now
+        # Lock нужен потому что PTB обрабатывает фото альбома параллельно —
+        # без него все 5 апдейтов проходят проверку до того как первый запишет ключ
+        async with channel_post_lock:
+            # Чистим старые записи
+            expired = [k for k, v in seen_channel_posts.items() if now - v >= CHANNEL_POST_TTL]
+            for k in expired:
+                del seen_channel_posts[k]
+
+            if post_key in seen_channel_posts:
+                return  # уже ответили на этот пост/альбом
+            seen_channel_posts[post_key] = now
 
         try:
             await msg.reply_text(
@@ -909,6 +915,35 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if (msg.text or "").lower().strip() == ans:
             await declare_winner(context.bot, user.id, active_event["prize"], active_event.get("stars", 0))
 
+
+
+
+# ══════════════════════════════════════════════════════
+#  Форвард в ЛС — узнать user_id
+# ══════════════════════════════════════════════════════
+
+async def owner_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Если владелец форвардит сообщение — показывает user_id отправителя."""
+    msg = update.message
+    if msg.chat.type != ChatType.PRIVATE or msg.from_user.id != OWNER_ID:
+        return
+    if not msg.forward_origin:
+        return
+    origin = msg.forward_origin
+    # PTB v20: forward_origin может быть MessageOriginUser и др.
+    user_id = None
+    name = "?"
+    if hasattr(origin, "sender_user") and origin.sender_user:
+        user_id = origin.sender_user.id
+        name = origin.sender_user.full_name
+    if user_id:
+        await msg.reply_text(
+            f"👤 *{name}*\n"
+            f"🆔 ID: `{user_id}`\n\n"
+            f"Чтобы выдать админку:\n"
+            f"`/admin {user_id} Звание`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
 # ══════════════════════════════════════════════════════
 #  ЛС владельца
@@ -983,6 +1018,11 @@ def main():
 
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, on_group_message))
 
+    # Форвард от владельца — узнать ID
+    app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & filters.User(OWNER_ID) & filters.FORWARDED & ~filters.COMMAND,
+        owner_forward,
+    ))
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & filters.User(OWNER_ID) & ~filters.COMMAND,
         owner_pm,
